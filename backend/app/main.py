@@ -1,76 +1,121 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+# app/main.py
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from .config import FRONTEND_ORIGINS
-from .agent import run_agent
-from .auth import create_access_token, hash_password, verify_password, decode_token
-from .db import SessionLocal, engine
-from . import models
+from sqlalchemy.orm import Session
+from app.config import settings
+from app.db import get_db, Base, engine
+from app import models, schemas, auth, agent, tools, utils
+from datetime import timedelta
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+import uvicorn
 
-models.Base.metadata.create_all(bind=engine)  # create tables
+# Create DB tables (simple init - use Alembic for production)
+Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="JEFF Agent Backend")
+app = FastAPI(title="JEFF Customer Support - Backend")
 
-origins = [o.strip() for o in (FRONTEND_ORIGINS or "*").split(",")]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+origins = [o.strip() for o in (settings.FRONTEND_ORIGINS or "*").split(",")]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- auth endpoints (very basic) ---
-class SignupIn(BaseModel):
-    email: str
-    password: str
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
-@app.post("/api/v1/auth/signup")
-def signup(payload: SignupIn):
-    db = SessionLocal()
-    hashed = hash_password(payload.password)
-    user = models.User(email=payload.email, hashed_password=hashed)
-    db.add(user); db.commit()
-    token = create_access_token({"sub": payload.email})
-    return {"access_token": token}
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    payload = auth.decode_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid auth")
+    user = db.query(models.User).filter(models.User.id == payload.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
-class SigninIn(BaseModel):
-    email: str
-    password: str
+@app.post("/auth/register", response_model=schemas.UserOut)
+def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(models.User).filter(models.User.email == user_in.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed = auth.hash_password(user_in.password)
+    user = models.User(email=user_in.email, hashed_password=hashed)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
-@app.post("/api/v1/auth/signin")
-def signin(payload: SigninIn):
-    db = SessionLocal()
-    u = db.query(models.User).filter(models.User.email==payload.email).first()
-    if not u or not verify_password(payload.password, u.hashed_password):
-        raise HTTPException(401, "Invalid credentials")
-    token = create_access_token({"sub": u.email})
-    return {"access_token": token}
+@app.post("/auth/token", response_model=schemas.Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == form_data.username).first()
+    if not user or not auth.verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Bad credentials")
+    token = auth.create_access_token({"user_id": user.id}, expires_delta=timedelta(minutes=settings.JWT_EXPIRE_MINUTES))
+    return {"access_token": token, "token_type":"bearer"}
 
-# --- chat endpoint ---
-class Ask(BaseModel):
-    message: str
-    session_id: str | None = "default"
+# Chat endpoint
+@app.post("/chat")
+def chat(message: str = Body(..., embed=True), ticket_id: int = Body(None), current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Build history
+    history_db = []
+    if ticket_id:
+        ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id).first()
+        if not ticket:
+            raise HTTPException(404, "Ticket not found")
+        for m in ticket.messages:
+            history_db.append({"role": m.role, "content": m.content})
 
-@app.post("/api/v1/ask")
-def ask(payload: Ask):
-    reply = run_agent(payload.message)
-    return {"response": reply}
+    reply = agent.chat_reply(message, history=history_db)
+    # save message & reply
+    user_msg = models.Message(role="user", content=message, user_id=current_user.id, ticket_id=ticket_id)
+    agent_msg = models.Message(role="agent", content=reply, user_id=None, ticket_id=ticket_id)
+    db.add_all([user_msg, agent_msg])
+    db.commit()
+    return {"reply": reply}
 
-# tickets, email, sms endpoints — wrap the functions in tools/agent
-@app.post("/api/v1/tickets")
-def create_ticket(title: str = Form(...), description: str = Form(...)):
-    db = SessionLocal()
-    t = models.Ticket(title=title, description=description)
-    db.add(t); db.commit(); db.refresh(t)
-    return {"ticket": {"id": t.id, "title": t.title}}
+# Ticket crud
+@app.post("/tickets", response_model=schemas.TicketOut)
+def create_ticket(ticket_in: schemas.TicketCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    ticket = models.Ticket(title=ticket_in.title, description=ticket_in.description, owner_id=current_user.id)
+    db.add(ticket)
+    db.commit()
+    db.refresh(ticket)
+    return ticket
 
-@app.get("/api/v1/tickets")
-def list_tickets():
-    db = SessionLocal()
-    rows = db.query(models.Ticket).order_by(models.Ticket.created_at.desc()).all()
-    return {"tickets": [{"id":r.id,"title":r.title,"status":r.status} for r in rows]}
+@app.get("/tickets", response_model=list[schemas.TicketOut])
+def list_tickets(limit: int = 50, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    return db.query(models.Ticket).filter(models.Ticket.owner_id == current_user.id).order_by(models.Ticket.created_at.desc()).limit(limit).all()
 
-# file upload endpoint (extract text, store to memory)
-@app.post("/api/v1/upload-file")
-async def upload_file(session_id: str = Form("default"), file: UploadFile = File(...)):
-    from .file_handler import extract_text_auto
-    content = await file.read()
-    text = extract_text_auto(file.filename, content)
-    # store to memory table — simple approach omitted here for brevity
-    return {"ok": True, "text_preview": text[:200]}
+# File upload endpoint
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), current_user: models.User = Depends(get_current_user)):
+    body = await file.read()
+    text = utils.extract_text_from_file(body, file.filename)
+    # Save as a message without ticket by default
+    return {"filename": file.filename, "extracted_text": text}
+
+# Admin: send email / SMS
+@app.post("/admin/send_email")
+def admin_send_email(to: str = Body(...), subject: str = Body(...), body: str = Body(...), current_user: models.User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admins only")
+    tools.send_email(to, subject, body)
+    return {"status": "sent"}
+
+@app.post("/admin/send_sms")
+def admin_send_sms(to: str = Body(...), body: str = Body(...), current_user: models.User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admins only")
+    sid = tools.send_sms(to, body)
+    return {"sid": sid}
+
+# Health
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# Run with: uvicorn app.main:app --host 0.0.0.0 --port 8000
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
 
