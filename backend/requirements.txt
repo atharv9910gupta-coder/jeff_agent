@@ -1,1 +1,15 @@
+fastapi==0.99.1
+uvicorn[standard]==0.22.0
+pydantic==1.10.12
+sqlalchemy==1.4.52
+databases==0.6.3
+python-dotenv==1.0.0
+psycopg2-binary==2.9.7
+requests==2.31.0
+python-multipart==0.0.6
+PyJWT==2.8.0
+python-jose==3.3.0
+pdfminer.six==20241107
+python-docx==0.8.11
+twilio==8.6.0
 
